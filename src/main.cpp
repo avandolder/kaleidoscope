@@ -153,3 +153,80 @@ std::unique_ptr<PrototypeAST> log_error_p(const char *str) {
   log_error(str);
   return nullptr;
 }
+
+// numberexpr ::= number
+static std::unique_ptr<ExprAST> parse_number_expr() {
+  auto result = llvm::make_unique<NumberExprAST>(num_val);
+  get_next_token();
+  return std::move(result);
+}
+
+/// parenexpr ::= '(' expression ')'
+static std::unique_ptr<ExprAST> parse_paren_expr() {
+  get_next_token();
+  auto v = parse_expression();
+  if (!v) {
+    return nullptr;
+  }
+
+  if (cur_tok != ')') {
+    return log_error("expected ')'");
+  }
+  get_next_token();
+  return v;
+}
+
+/// identifierexpr
+///   ::= identifier
+///   ::= identifier '(' expression* ')'
+static std::unique_ptr<ExprAST> parse_identifier_expr() {
+  std::string id_name = identifier_str;
+
+  get_next_token();
+
+  if (cur_tok != '(') {
+    return llvm::make_unique<VariableExprAST>(id_name);
+  }
+
+  get_next_token();
+  std::vector<std::unique_ptr<ExprAST>> args;
+  if (cur_tok != ')') {
+    for (;;) {
+      if (auto arg = parse_expression()) {
+        args.push_back(std::move(arg));
+      } else {
+        return nullptr;
+      }
+
+      if (cur_tok == ')') {
+        break;
+      }
+
+      if (cur_tok != ',') {
+        return log_error("expected ')' or ',' in argument list");
+      }
+      get_next_token();
+    }
+  }
+
+  get_next_token();
+
+  return llvm::make_unique<CallExprAST>(id_name, std::move(args));
+}
+
+/// primary
+///   ::= identifierexpr
+///   ::= numberexpr
+///   ::= parenexpr
+static std::unique_ptr<ExprAST> parse_primary() {
+  switch (cur_tok) {
+    default:
+      return log_error("unknown token when expecting an expression");
+    case tok_identifier:
+      return parse_identifier_expr();
+    case tok_number:
+      return parse_number_expr();
+    case '(':
+      return parse_paren_expr();
+  }
+}
