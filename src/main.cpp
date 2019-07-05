@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -5,6 +6,8 @@
 #include <memory>
 #include <string>
 #include <vector>
+
+#include "llvm/ADT/STLExtras.h"
 
 // The lexer returns token [0-255] if it is an unkown character, otherwise one
 // of these for known things.
@@ -155,6 +158,27 @@ std::unique_ptr<PrototypeAST> log_error_p(const char *str) {
   return nullptr;
 }
 
+/// binop_precedence - This holds the precedence for each binary operator
+/// that is defined.
+static std::map<char, int> binop_precedence;
+
+/// get_tok_precedence - Get the precedence of the pending binary operator
+/// token.
+static int get_tok_precedence() {
+  if (!isascii(cur_tok)) {
+    return -1;
+  }
+
+  // Make sure it's a declared binop.
+  int tok_prec = binop_precedence[cur_tok];
+  if (tok_prec <= 0) {
+    return -1;
+  }
+  return tok_prec;
+}
+
+static std::unique_ptr<ExprAST> parse_expression();
+
 // numberexpr ::= number
 static std::unique_ptr<ExprAST> parse_number_expr() {
   auto result = llvm::make_unique<NumberExprAST>(num_val);
@@ -232,35 +256,6 @@ static std::unique_ptr<ExprAST> parse_primary() {
   }
 }
 
-/// binop_precedence - This holds the precedence for each binary operator
-/// that is defined.
-static std::map<char, int> binop_precedence;
-
-/// get_tok_precedence - Get the precedence of the pending binary operator
-/// token.
-static int get_tok_precedence() {
-  if (!isascii(cur_tok)) {
-    return -1;
-  }
-
-  // Make sure it's a declared binop.
-  int tok_prec = binop_precedence[cur_tok];
-  if (tok_prec <= 0) {
-    return -1;
-  }
-  return tok_prec;
-}
-
-/// expression
-///   ::= primary binoprhs
-static std::unique_ptr<ExprAST> parse_expression() {
-  auto lhs = parse_primary();
-  if (!lhs) {
-    return nullptr;
-  }
-  return parse_binop_rhs(0, std::move(lhs));
-}
-
 /// binorphs
 ///   ::= ('+' primary)*
 static std::unique_ptr<ExprAST> parse_binop_rhs(int expr_prec,
@@ -300,6 +295,123 @@ static std::unique_ptr<ExprAST> parse_binop_rhs(int expr_prec,
   }
 }
 
+/// expression
+///   ::= primary binoprhs
+static std::unique_ptr<ExprAST> parse_expression() {
+  auto lhs = parse_primary();
+  if (!lhs) {
+    return nullptr;
+  }
+  return parse_binop_rhs(0, std::move(lhs));
+}
+
+/// prototype
+///   ::= id '(' id* ')'
+static std::unique_ptr<PrototypeAST> parse_prototype() {
+  if (cur_tok != tok_identifier) {
+    return log_error_p("expected function name in prototype");
+  }
+
+  std::string fn_name = identifier_str;
+  get_next_token();
+
+  if (cur_tok != '(') {
+    return log_error_p("expected '(' in prototype");
+  }
+
+  // Read the list of argument names.
+  std::vector<std::string> arg_names;
+  while (get_next_token() == tok_identifier) {
+    arg_names.push_back(identifier_str);
+  }
+  if (cur_tok != ')') {
+    return log_error_p("expected ')' in prototype");
+  }
+
+  // Success.
+  get_next_token();
+
+  return llvm::make_unique<PrototypeAST>(fn_name, std::move(arg_names));
+}
+
+// definition ::= 'def' prototype expression
+static std::unique_ptr<FunctionAST> parse_definition() {
+  get_next_token();
+  auto proto = parse_prototype();
+  if (!proto) {
+    return nullptr;
+  }
+
+  if (auto e = parse_expression()) {
+    return llvm::make_unique<FunctionAST>(std::move(proto), std::move(e));
+  }
+  return nullptr;
+}
+
+/// external ::= 'extern' prototype
+static std::unique_ptr<PrototypeAST> parse_extern() {
+  get_next_token();
+  return parse_prototype();
+}
+
+/// toplevelexpr ::= expression
+static std::unique_ptr<FunctionAST> parse_top_level_expr() {
+  if (auto e = parse_expression()) {
+    // Make an anonymous proto.
+    auto proto =
+      llvm::make_unique<PrototypeAST>("", std::vector<std::string>());
+    return llvm::make_unique<FunctionAST>(std::move(proto), std::move(e));
+  }
+  return nullptr;
+}
+
+static void handle_definition() {
+  if (parse_definition()) {
+    std::fprintf(stderr, "Parsed a function definition.\n");
+  } else {
+    get_next_token();
+  }
+}
+
+static void handle_extern() {
+  if (parse_extern()) {
+    std::fprintf(stderr, "Parsed an extern\n");
+  } else {
+    get_next_token();
+  }
+}
+
+static void handle_top_level_expression() {
+  // Evaluate a top-level expression into an anonymous function.
+  if (parse_top_level_expr()) {
+    std::fprintf(stderr, "Parsed a top-level expr\n");
+  } else {
+    get_next_token();
+  }
+}
+
+/// top ::= definition | external | expression | ';'
+static void main_loop() {
+  for (;;) {
+    std::fprintf(stderr, "ready> ");
+    switch (cur_tok) {
+    case tok_eof:
+      return;
+    case ';':
+      get_next_token();
+      break;
+    case tok_def:
+      handle_definition();
+    case tok_extern:
+      handle_extern();
+      break;
+    default:
+      handle_top_level_expression();
+      break;
+    }
+  }
+}
+
 int main() {
   // Install standard binary operators.
   // 1 is lowest precedence.
@@ -307,4 +419,11 @@ int main() {
   binop_precedence['+'] = 20;
   binop_precedence['-'] = 20;
   binop_precedence['*'] = 40;
+
+  std::fprintf(stderr, "ready> ");
+  get_next_token();
+
+  main_loop();
+
+  return 0;
 }
