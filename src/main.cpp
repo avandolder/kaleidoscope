@@ -138,3 +138,18 @@ public:
               std::unique_ptr<ExprAST> body)
     : proto(std::move(proto)), body(std::move(body)) {}
 };
+
+static int cur_tok;
+static int get_next_token() {
+  return cur_tok = gettok();
+}
+
+std::unique_ptr<ExprAST> log_error(const char *str) {
+  std::fprintf(stderr, "LogError: %s\n", str);
+  return nullptr;
+}
+
+std::unique_ptr<PrototypeAST> log_error_p(const char *str) {
+  log_error(str);
+  return nullptr;
+}
