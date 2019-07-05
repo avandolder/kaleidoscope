@@ -1,6 +1,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -229,4 +230,81 @@ static std::unique_ptr<ExprAST> parse_primary() {
     case '(':
       return parse_paren_expr();
   }
+}
+
+/// binop_precedence - This holds the precedence for each binary operator
+/// that is defined.
+static std::map<char, int> binop_precedence;
+
+/// get_tok_precedence - Get the precedence of the pending binary operator
+/// token.
+static int get_tok_precedence() {
+  if (!isascii(cur_tok)) {
+    return -1;
+  }
+
+  // Make sure it's a declared binop.
+  int tok_prec = binop_precedence[cur_tok];
+  if (tok_prec <= 0) {
+    return -1;
+  }
+  return tok_prec;
+}
+
+/// expression
+///   ::= primary binoprhs
+static std::unique_ptr<ExprAST> parse_expression() {
+  auto lhs = parse_primary();
+  if (!lhs) {
+    return nullptr;
+  }
+  return parse_binop_rhs(0, std::move(lhs));
+}
+
+/// binorphs
+///   ::= ('+' primary)*
+static std::unique_ptr<ExprAST> parse_binop_rhs(int expr_prec,
+                                                std::unique_ptr<ExprAST> lhs) {
+  // If this is a binop, find its precedence.
+  for (;;) {
+    int tok_prec = get_tok_precedence();
+
+    // If this is a binop that binds at least as tightly as the current
+    // binop, consume it, otherwise we are done.
+    if (tok_prec < expr_prec) {
+      return lhs;
+    }
+
+    // Okay, we know this is a binop.
+    int binop = cur_tok;
+    get_next_token();
+
+    auto rhs = parse_primary();
+    if (!rhs) {
+      return nullptr;
+    }
+
+    // If binop binds less tightly with rhs than the operator after rhs,
+    // let the pending operator take rhs as its lhs.
+    int next_prec = get_tok_precedence();
+    if (tok_prec < next_prec) {
+      rhs = parse_binop_rhs(tok_prec + 1, std::move(rhs));
+      if (!rhs) {
+        return nullptr;
+      }
+    }
+
+    // Merge lhs/rhs.
+    lhs = llvm::make_unique<BinaryExprAST>(
+        binop, std::move(lhs), std::move(rhs));
+  }
+}
+
+int main() {
+  // Install standard binary operators.
+  // 1 is lowest precedence.
+  binop_precedence['<'] = 10;
+  binop_precedence['+'] = 20;
+  binop_precedence['-'] = 20;
+  binop_precedence['*'] = 40;
 }
