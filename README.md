@@ -1,1 +1,1 @@
-Implementation of the Kaleidoscope language as described in the [LLVM Tutorial](llvm.org/docs/tutorial/index.html).
+Implementation of the Kaleidoscope language as described in the [LLVM Tutorial](http://llvm.org/docs/tutorial/index.html).
