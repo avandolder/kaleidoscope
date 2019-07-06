@@ -7,7 +7,22 @@
 #include <string>
 #include <vector>
 
+#include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Module.h"
+#include "llvm/IR/Type.h"
+#include "llvm/IR/Verifier.h"
+#include "llvm/Support/raw_ostream.h"
+
+using namespace llvm;
+
+//----- LEXER
 
 // The lexer returns token [0-255] if it is an unkown character, otherwise one
 // of these for known things.
@@ -82,6 +97,8 @@ static int gettok() {
   return this_char;
 }
 
+//----- PARSER
+
 // ExprAST - base class for all expression nodes.
 class ExprAST {
 public:
@@ -134,7 +151,7 @@ class PrototypeAST {
 public:
   PrototypeAST(const std::string &name, std::vector<std::string> args)
     : name(name), args(std::move(args)) {}
-  virtual Value *codegen();
+  virtual Function *codegen();
 
   const std::string &get_name() const { return name; }
 };
@@ -147,7 +164,7 @@ public:
   FunctionAST(std::unique_ptr<PrototypeAST> proto,
               std::unique_ptr<ExprAST> body)
     : proto(std::move(proto)), body(std::move(body)) {}
-  virtual Value *codegen();
+  virtual Function *codegen();
 };
 
 static int cur_tok;
@@ -442,17 +459,83 @@ Value *CallExprAST::codegen() {
   return builder.CreateCall(callee_fn, argsv, "calltmp");
 }
 
+Function *PrototypeAST::codegen() {
+  // Make the function type: double(double,double) etc.
+  std::vector<Type*> doubles(args.size(), Type::getDoubleTy(context));
+  FunctionType *ft =
+    FunctionType::get(Type::getDoubleTy(context), doubles, false);
+  Function *f =
+    Function::Create(ft, Function::ExternalLinkage, name, module.get());
+
+  // Set names for all arguments.
+  unsigned idx = 0;
+  for (auto &arg: f->args()) {
+    arg.setName(args[idx++]);
+  }
+
+  return f;
+}
+
+Function *FunctionAST::codegen() {
+  // First, check for an existing function from a previous 'extern' decl.
+  Function *fn = module->getFunction(proto->get_name());
+  
+  if (!fn) {
+    fn = proto->codegen();
+  }
+  if (!fn) {
+    return nullptr;
+  }
+  if (!fn->empty()) {
+    return (Function*) log_error_v("Function cannot be redefined.");
+  }
+
+  // Create a new basic block to start insertion into.
+  BasicBlock *bb = BasicBlock::Create(context, "entry", fn);
+  builder.SetInsertPoint(bb);
+
+  // Record the function arguments in the named_values map.
+  named_values.clear();
+  for (auto &arg: fn->args()) {
+    named_values[arg.getName()] = &arg;
+  }
+
+  if (Value *ret_val = body->codegen()) {
+    // Finish off the function.
+    builder.CreateRet(ret_val);
+
+    // Validate the generate code, checking for consistency.
+    verifyFunction(*fn);
+
+    return fn;
+  }
+
+  // Error reading body, remove function.
+  fn->eraseFromParent();
+  return nullptr;
+}
+
+//----- JIT DRIVER
+
 static void handle_definition() {
-  if (parse_definition()) {
-    std::fprintf(stderr, "Parsed a function definition.\n");
+  if (auto fn_ast = parse_definition()) {
+    if (auto *fn_ir = fn_ast->codegen()) {
+      std::fprintf(stderr, "Read function definition:");
+      fn_ir->print(errs());
+      fprintf(stderr, "\n");
+    }
   } else {
     get_next_token();
   }
 }
 
 static void handle_extern() {
-  if (parse_extern()) {
-    std::fprintf(stderr, "Parsed an extern\n");
+  if (auto proto_ast = parse_extern()) {
+    if (auto *fn_ir = proto_ast->codegen()) {
+      std::fprintf(stderr, "Read extern: ");
+      fn_ir->print(errs());
+      fprintf(stderr, "\n");
+    }
   } else {
     get_next_token();
   }
@@ -460,8 +543,12 @@ static void handle_extern() {
 
 static void handle_top_level_expression() {
   // Evaluate a top-level expression into an anonymous function.
-  if (parse_top_level_expr()) {
-    std::fprintf(stderr, "Parsed a top-level expr\n");
+  if (auto fn_ast = parse_top_level_expr()) {
+    if (auto *fn_ir = fn_ast->codegen()) {
+      std::fprintf(stderr, "Read top-level expr:");
+      fn_ir->print(errs());
+      fprintf(stderr, "\n");
+    }
   } else {
     get_next_token();
   }
@@ -500,7 +587,13 @@ int main() {
   std::fprintf(stderr, "ready> ");
   get_next_token();
 
+  // Make the module, which holds all the code.
+  module = llvm::make_unique<Module>("my cool jit", context);
+
   main_loop();
+
+  // Print out all generate code.
+  module->print(errs(), nullptr);
 
   return 0;
 }
