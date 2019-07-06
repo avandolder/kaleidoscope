@@ -86,6 +86,7 @@ static int gettok() {
 class ExprAST {
 public:
   virtual ~ExprAST() {}
+  virtual Value *codegen() = 0;
 };
 
 class NumberExprAST : public ExprAST {
@@ -93,6 +94,7 @@ class NumberExprAST : public ExprAST {
 
 public:
   NumberExprAST(double val) : val(val) {}
+  virtual Value *codegen();
 };
 
 class VariableExprAST : public ExprAST {
@@ -100,6 +102,7 @@ class VariableExprAST : public ExprAST {
 
 public:
   VariableExprAST(const std::string &name) : name(name) {}
+  virtual Value *codegen();
 };
 
 class BinaryExprAST : public ExprAST {
@@ -110,6 +113,7 @@ public:
   BinaryExprAST(char op, std::unique_ptr<ExprAST> lhs,
                 std::unique_ptr<ExprAST> rhs)
     : op(op), lhs(std::move(lhs)), rhs(std::move(rhs)) {}
+  virtual Value *codegen();
 };
 
 class CallExprAST : public ExprAST {
@@ -120,6 +124,7 @@ public:
   CallExprAST(const std::string &callee,
               std::vector<std::unique_ptr<ExprAST>> args)
     : callee(callee), args(std::move(args)) {}
+  virtual Value *codegen();
 };
 
 class PrototypeAST {
@@ -129,6 +134,7 @@ class PrototypeAST {
 public:
   PrototypeAST(const std::string &name, std::vector<std::string> args)
     : name(name), args(std::move(args)) {}
+  virtual Value *codegen();
 
   const std::string &get_name() const { return name; }
 };
@@ -141,6 +147,7 @@ public:
   FunctionAST(std::unique_ptr<PrototypeAST> proto,
               std::unique_ptr<ExprAST> body)
     : proto(std::move(proto)), body(std::move(body)) {}
+  virtual Value *codegen();
 };
 
 static int cur_tok;
@@ -363,6 +370,76 @@ static std::unique_ptr<FunctionAST> parse_top_level_expr() {
     return llvm::make_unique<FunctionAST>(std::move(proto), std::move(e));
   }
   return nullptr;
+}
+
+//----- CODE GEN
+static LLVMContext context;
+static IRBuilder<> builder(context);
+static std::unique_ptr<Module> module;
+static std::map<std::string, Value*> named_values;
+
+Value *log_error_v(const char *str) {
+  log_error(str);
+  return nullptr;
+}
+
+Value *NumberExprAST::codegen() {
+  return ConstantFP::get(context, APFloat(val));
+}
+
+Value *VariableExprAST::codegen() {
+  // Look this variable up in the function.
+  Value *v = named_values[name];
+  if (!v) {
+    log_error_v("Unknown variable name");
+  }
+  return v;
+}
+
+Value *BinaryExprAST::codegen() {
+  Value *l = lhs->codegen();
+  Value *r = rhs->codegen();
+  if (!l || !r) {
+    return nullptr;
+  }
+
+  switch (op) {
+  case '+':
+    return builder.CreateFAdd(l, r, "addtmp");
+  case '-':
+    return builder.CreateFSub(l, r, "subtmp");
+  case '*':
+    return builder.CreateFMul(l, r, "multmp");
+  case '<':
+    l = builder.CreateFCmpULT(l, r, "cmptmp");
+    // Convert bool 0/1 to double 0.0 or 1.0
+    return builder.CreateUIToFP(l, Type::getDoubleTy(context), "booltmp");
+  default:
+    return log_error_v("invalid binary operator");
+  }
+}
+
+Value *CallExprAST::codegen() {
+  // Look up the name in the global module table.
+  Function *callee_fn = module->getFunction(callee);
+  if (!callee_fn) {
+    return log_error_v("Unknown function referenced");
+  }
+
+  // If argument mismatch error.
+  if (callee_fn->arg_size() != args.size()) {
+    return log_error_v("Incorrect # of arguments passed");
+  }
+
+  std::vector<Value *> argsv;
+  for (unsigned i = 0, e = args.size(); i != e; ++i) {
+    argsv.push_back(args[i]->codegen());
+    if (!argsv.back()) {
+      return nullptr;
+    }
+  }
+
+  return builder.CreateCall(callee_fn, argsv, "calltmp");
 }
 
 static void handle_definition() {
