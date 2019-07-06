@@ -14,11 +14,17 @@
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Verifier.h"
+#include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Target/TargetMachine.h"
+#include "llvm/Transforms/InstCombine/InstCombine.h"
+#include "llvm/Transforms/Scalar.h"
+#include "llvm/Transforms/Scalar/GVN.h"
 
 using namespace llvm;
 
@@ -394,6 +400,7 @@ static LLVMContext context;
 static IRBuilder<> builder(context);
 static std::unique_ptr<Module> module;
 static std::map<std::string, Value*> named_values;
+static std::unique_ptr<legacy::FunctionPassManager> fpm;
 
 Value *log_error_v(const char *str) {
   log_error(str);
@@ -507,12 +514,35 @@ Function *FunctionAST::codegen() {
     // Validate the generate code, checking for consistency.
     verifyFunction(*fn);
 
+    // Optimize the function.
+    fpm->run(*fn);
+
     return fn;
   }
 
   // Error reading body, remove function.
   fn->eraseFromParent();
   return nullptr;
+}
+
+//----- OPTIMIZATION
+void init_module_and_pass_manager() {
+  // Open a new module.
+  module = llvm::make_unique<Module>("my cool jit", context);
+
+  // Create a new pass manager attached to it.
+  fpm = llvm::make_unique<legacy::FunctionPassManager>(module.get());
+
+  // Do simple "peephole" optimizations and bit-twiddling optzns.
+  fpm->add(createInstructionCombiningPass());
+  // Reassociate expressions.
+  fpm->add(createReassociatePass());
+  // Eliminate common subexpressions.
+  fpm->add(createGVNPass());
+  // Simplify the control flow graph (deleting unreachable blocks, etc).
+  fpm->add(createCFGSimplificationPass());
+
+  fpm->doInitialization();
 }
 
 //----- JIT DRIVER
@@ -587,8 +617,7 @@ int main() {
   std::fprintf(stderr, "ready> ");
   get_next_token();
 
-  // Make the module, which holds all the code.
-  module = llvm::make_unique<Module>("my cool jit", context);
+  init_module_and_pass_manager();
 
   main_loop();
 
