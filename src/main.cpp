@@ -26,7 +26,10 @@
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Scalar/GVN.h"
 
+#include "KaleidoscopeJIT.h"
+
 using namespace llvm;
+using namespace llvm::orc;
 
 //----- LEXER
 
@@ -117,7 +120,7 @@ class NumberExprAST : public ExprAST {
 
 public:
   NumberExprAST(double val) : val(val) {}
-  virtual Value *codegen();
+  Value *codegen() override;
 };
 
 class VariableExprAST : public ExprAST {
@@ -125,7 +128,7 @@ class VariableExprAST : public ExprAST {
 
 public:
   VariableExprAST(const std::string &name) : name(name) {}
-  virtual Value *codegen();
+  Value *codegen() override;
 };
 
 class BinaryExprAST : public ExprAST {
@@ -136,7 +139,7 @@ public:
   BinaryExprAST(char op, std::unique_ptr<ExprAST> lhs,
                 std::unique_ptr<ExprAST> rhs)
     : op(op), lhs(std::move(lhs)), rhs(std::move(rhs)) {}
-  virtual Value *codegen();
+  Value *codegen() override;
 };
 
 class CallExprAST : public ExprAST {
@@ -147,7 +150,7 @@ public:
   CallExprAST(const std::string &callee,
               std::vector<std::unique_ptr<ExprAST>> args)
     : callee(callee), args(std::move(args)) {}
-  virtual Value *codegen();
+  Value *codegen() override;
 };
 
 class PrototypeAST {
@@ -157,7 +160,7 @@ class PrototypeAST {
 public:
   PrototypeAST(const std::string &name, std::vector<std::string> args)
     : name(name), args(std::move(args)) {}
-  virtual Function *codegen();
+  Function *codegen();
 
   const std::string &get_name() const { return name; }
 };
@@ -170,7 +173,7 @@ public:
   FunctionAST(std::unique_ptr<PrototypeAST> proto,
               std::unique_ptr<ExprAST> body)
     : proto(std::move(proto)), body(std::move(body)) {}
-  virtual Function *codegen();
+  Function *codegen();
 };
 
 static int cur_tok;
@@ -388,8 +391,8 @@ static std::unique_ptr<PrototypeAST> parse_extern() {
 static std::unique_ptr<FunctionAST> parse_top_level_expr() {
   if (auto e = parse_expression()) {
     // Make an anonymous proto.
-    auto proto =
-      llvm::make_unique<PrototypeAST>("", std::vector<std::string>());
+    auto proto = llvm::make_unique<PrototypeAST>("__anon_expr",
+                                                 std::vector<std::string>());
     return llvm::make_unique<FunctionAST>(std::move(proto), std::move(e));
   }
   return nullptr;
@@ -401,9 +404,24 @@ static IRBuilder<> builder(context);
 static std::unique_ptr<Module> module;
 static std::map<std::string, Value*> named_values;
 static std::unique_ptr<legacy::FunctionPassManager> fpm;
+static std::unique_ptr<KaleidoscopeJIT> jit;
+static std::map<std::string, std::unique_ptr<PrototypeAST>> fn_protos;
 
 Value *log_error_v(const char *str) {
   log_error(str);
+  return nullptr;
+}
+
+Function *get_function(std::string name) {
+  if (auto *f = module->getFunction(name)) {
+    return f;
+  }
+
+  auto fi = fn_protos.find(name);
+  if (fi != fn_protos.end()) {
+    return fi->second->codegen();
+  }
+
   return nullptr;
 }
 
@@ -445,7 +463,7 @@ Value *BinaryExprAST::codegen() {
 
 Value *CallExprAST::codegen() {
   // Look up the name in the global module table.
-  Function *callee_fn = module->getFunction(callee);
+  Function *callee_fn = get_function(callee);
   if (!callee_fn) {
     return log_error_v("Unknown function referenced");
   }
@@ -484,12 +502,12 @@ Function *PrototypeAST::codegen() {
 }
 
 Function *FunctionAST::codegen() {
-  // First, check for an existing function from a previous 'extern' decl.
-  Function *fn = module->getFunction(proto->get_name());
+  // Transfer ownership of the prototype to the fn_protos map, but keep a
+  // reference to it for use below.
+  auto &p = *proto;
+  fn_protos[proto->get_name()] = std::move(proto);
+  Function *fn = get_function(p.get_name());
   
-  if (!fn) {
-    fn = proto->codegen();
-  }
   if (!fn) {
     return nullptr;
   }
@@ -529,6 +547,7 @@ Function *FunctionAST::codegen() {
 void init_module_and_pass_manager() {
   // Open a new module.
   module = llvm::make_unique<Module>("my cool jit", context);
+  module->setDataLayout(jit->getTargetMachine().createDataLayout());
 
   // Create a new pass manager attached to it.
   fpm = llvm::make_unique<legacy::FunctionPassManager>(module.get());
@@ -553,6 +572,8 @@ static void handle_definition() {
       std::fprintf(stderr, "Read function definition:");
       fn_ir->print(errs());
       fprintf(stderr, "\n");
+      jit->addModule(std::move(module));
+      init_module_and_pass_manager();
     }
   } else {
     get_next_token();
@@ -565,6 +586,7 @@ static void handle_extern() {
       std::fprintf(stderr, "Read extern: ");
       fn_ir->print(errs());
       fprintf(stderr, "\n");
+      fn_protos[proto_ast->get_name()] = std::move(proto_ast);
     }
   } else {
     get_next_token();
@@ -574,10 +596,23 @@ static void handle_extern() {
 static void handle_top_level_expression() {
   // Evaluate a top-level expression into an anonymous function.
   if (auto fn_ast = parse_top_level_expr()) {
-    if (auto *fn_ir = fn_ast->codegen()) {
-      std::fprintf(stderr, "Read top-level expr:");
-      fn_ir->print(errs());
-      fprintf(stderr, "\n");
+    if (fn_ast->codegen()) {
+      // JIT the module containing the anon expr, keeping a handle so
+      // we can free it later.
+      auto h = jit->addModule(std::move(module));
+      init_module_and_pass_manager();
+
+      // Search the JIT for the __anon_expr symbol.
+      auto expr_symbol = jit->findSymbol("__anon_expr");
+      assert(expr_symbol && "Function not found");
+
+      // Get the symbol's addr and cast it to the right type (takes no
+      // arguments, returns a double) so we can call it as a native fn.
+      double (*fp)() = (double (*)())(intptr_t)cantFail(expr_symbol.getAddress());
+      std::fprintf(stderr, "Evaluated to %f\n", fp());
+
+      // Delete anon expr module from the JIT.
+      jit->removeModule(h);
     }
   } else {
     get_next_token();
@@ -606,7 +641,27 @@ static void main_loop() {
   }
 }
 
+#ifdef _WIN32
+#define DLLEXPORT __declspec(dllexport)
+#else
+#define DLLEXPORT
+#endif
+
+extern "C" DLLEXPORT double putchard(double x) {
+  fputc((char)x, stderr);
+  return 0;
+}
+
+extern "C" DLLEXPORT double printd(double x) {
+  fprintf(stderr, "%f\n", x);
+  return 0;
+}
+
 int main() {
+  InitializeNativeTarget();
+  InitializeNativeTargetAsmPrinter();
+  InitializeNativeTargetAsmParser();
+
   // Install standard binary operators.
   // 1 is lowest precedence.
   binop_precedence['<'] = 10;
@@ -617,12 +672,11 @@ int main() {
   std::fprintf(stderr, "ready> ");
   get_next_token();
 
+  jit = llvm::make_unique<KaleidoscopeJIT>();
+
   init_module_and_pass_manager();
 
   main_loop();
-
-  // Print out all generate code.
-  module->print(errs(), nullptr);
 
   return 0;
 }
