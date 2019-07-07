@@ -45,6 +45,11 @@ enum Token {
   // primary
   tok_identifier = -4,
   tok_number = -5,
+
+  // control
+  tok_if = -6,
+  tok_then = -7,
+  tok_else = -8,
 };
 
 static std::string identifier_str; // Filled in if tok_identifier
@@ -69,6 +74,12 @@ static int gettok() {
       return tok_def;
     } else if (identifier_str == "extern") {
       return tok_extern;
+    } else if (identifier_str == "if") {
+      return tok_if;
+    } else if (identifier_str == "then") {
+      return tok_then;
+    } else if (identifier_str == "else") {
+      return tok_else;
     }
     return tok_identifier;
   }
@@ -176,6 +187,19 @@ public:
   Function *codegen();
 };
 
+class IfExprAST : public ExprAST {
+  std::unique_ptr<ExprAST> cond, thenexpr, elseexpr;
+
+public:
+  IfExprAST(std::unique_ptr<ExprAST> cond,
+            std::unique_ptr<ExprAST> thenexpr,
+            std::unique_ptr<ExprAST> elseexpr)
+    : cond(std::move(cond)), thenexpr(std::move(thenexpr)),
+      elseexpr(std::move(elseexpr)) {}
+
+  Value *codegen() override;
+};
+
 static int cur_tok;
 static int get_next_token() {
   return cur_tok = gettok();
@@ -272,6 +296,41 @@ static std::unique_ptr<ExprAST> parse_identifier_expr() {
   return llvm::make_unique<CallExprAST>(id_name, std::move(args));
 }
 
+/// ifexpr ::= 'if' expression 'then' expression 'else' expression
+static std::unique_ptr<ExprAST> parse_if_expr() {
+  get_next_token(); // eat the if
+
+  // condition
+  auto cond = parse_expression();
+  if (!cond) {
+    return nullptr;
+  }
+
+  if (cur_tok != tok_then) {
+    return log_error("expected then");
+  }
+  get_next_token(); // eat the then
+
+  auto thenexpr = parse_expression();
+  if (!thenexpr) {
+    return nullptr;
+  }
+
+  if (cur_tok != tok_else) {
+    return log_error("expected else");
+  }
+
+  get_next_token();
+
+  auto elseexpr = parse_expression();
+  if (!elseexpr) {
+    return nullptr;
+  }
+
+  return llvm::make_unique<IfExprAST>(
+      std::move(cond), std::move(thenexpr), std::move(elseexpr));
+}
+
 /// primary
 ///   ::= identifierexpr
 ///   ::= numberexpr
@@ -286,6 +345,8 @@ static std::unique_ptr<ExprAST> parse_primary() {
       return parse_number_expr();
     case '(':
       return parse_paren_expr();
+    case tok_if:
+      return parse_if_expr();
   }
 }
 
@@ -541,6 +602,60 @@ Function *FunctionAST::codegen() {
   // Error reading body, remove function.
   fn->eraseFromParent();
   return nullptr;
+}
+
+Value *IfExprAST::codegen() {
+  Value *condv = cond->codegen();
+  if (!condv) {
+    return nullptr;
+  }
+
+  // Convert condition to a bool by comparing to 0.0.
+  condv = builder.CreateFCmpONE(
+      condv, ConstantFP::get(context, APFloat(0.0)), "ifcond");
+
+  Function *fn = builder.GetInsertBlock()->getParent();
+
+  // Create blocks for the then and else cases, insert 'then' block at the end
+  // of the function.
+  BasicBlock *thenbb = BasicBlock::Create(context, "then", fn);
+  BasicBlock *elsebb = BasicBlock::Create(context, "else");
+  BasicBlock *mergebb = BasicBlock::Create(context, "ifcont");
+  builder.CreateCondBr(condv, thenbb, elsebb);
+
+  // Emit then value.
+  builder.SetInsertPoint(thenbb);
+
+  Value *thenv = thenexpr->codegen();
+  if (!thenv) {
+    return nullptr;
+  }
+
+  builder.CreateBr(mergebb);
+  // Codegen of the 'then' can change the current block, update thenbb for PHI.
+  thenbb = builder.GetInsertBlock();
+
+  // Emit else block.
+  fn->getBasicBlockList().push_back(elsebb);
+  builder.SetInsertPoint(elsebb);
+
+  Value *elsev = elseexpr->codegen();
+  if (!elsev) {
+    return nullptr;
+  }
+
+  builder.CreateBr(mergebb);
+  // codegen of 'Else' can change the current block, update elsebb for PHI.
+  elsebb = builder.GetInsertBlock();
+
+  // Emit merge block.
+  fn->getBasicBlockList().push_back(mergebb);
+  builder.SetInsertPoint(mergebb);
+  PHINode *pn = builder.CreatePHI(Type::getDoubleTy(context), 2, "iftmp");
+
+  pn->addIncoming(thenv, thenbb);
+  pn->addIncoming(elsev, elsebb);
+  return pn;
 }
 
 //----- OPTIMIZATION
