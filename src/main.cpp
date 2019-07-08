@@ -1035,12 +1035,12 @@ static void main_loop(bool print) {
 #endif
 
 extern "C" DLLEXPORT double putchard(double x) {
-  fputc((char)x, stderr);
+  std::fputc((char)x, stderr);
   return 0;
 }
 
 extern "C" DLLEXPORT double printd(double x) {
-  fprintf(stderr, "%f\n", x);
+  std::fprintf(stderr, "%f\n", x);
   return 0;
 }
 
