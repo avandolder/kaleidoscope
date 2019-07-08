@@ -52,6 +52,8 @@ enum Token {
   tok_else = -8,
   tok_for = -9,
   tok_in = -10,
+  tok_binary = -11,
+  tok_unary = -12,
 };
 
 static std::string identifier_str; // Filled in if tok_identifier
@@ -86,6 +88,10 @@ static int gettok() {
       return tok_for;
     } else if (identifier_str == "in") {
       return tok_in;
+    } else if (identifier_str == "binary") {
+      return tok_binary;
+    } else if (identifier_str == "unary") {
+      return tok_unary;
     }
     return tok_identifier;
   }
@@ -173,13 +179,27 @@ public:
 class PrototypeAST {
   std::string name;
   std::vector<std::string> args;
+  bool is_operator;
+  unsigned precedence; // Precedence if a binary op
 
 public:
-  PrototypeAST(const std::string &name, std::vector<std::string> args)
-    : name(name), args(std::move(args)) {}
-  Function *codegen();
+  PrototypeAST(const std::string &name, std::vector<std::string> args,
+               bool is_operator = false, unsigned prec = 0)
+    : name(name), args(std::move(args)), is_operator(is_operator),
+      precedence(prec) {}
 
+  Function *codegen();
   const std::string &get_name() const { return name; }
+
+  bool is_unary_op() const { return is_operator && args.size() == 1; }
+  bool is_binary_op() const { return is_operator && args.size() == 2; }
+
+  char get_operator_name() const {
+    assert(is_unary_op() || is_binary_op());
+    return name[name.size() - 1];
+  }
+
+  unsigned get_binary_precedence() const { return precedence; }
 };
 
 class FunctionAST {
@@ -216,6 +236,17 @@ public:
              std::unique_ptr<ExprAST> body)
     : var_name(var_name), start(std::move(start)), end(std::move(end)),
       step(std::move(step)), body(std::move(body)) {}
+
+  Value *codegen() override;
+};
+
+class UnaryExprAST : public ExprAST {
+  char opcode;
+  std::unique_ptr<ExprAST> operand;
+
+public:
+  UnaryExprAST(char opcode, std::unique_ptr<ExprAST> operand)
+    : opcode(opcode), operand(std::move(operand)) {}
 
   Value *codegen() override;
 };
@@ -425,6 +456,21 @@ static std::unique_ptr<ExprAST> parse_primary() {
   }
 }
 
+static std::unique_ptr<ExprAST> parse_unary() {
+  // If the current token is not an operaotr, it must be a primary expr.
+  if (!isascii(cur_tok) || cur_tok == '(' || cur_tok == ',') {
+    return parse_primary();
+  }
+
+  // If this is a unary operator, read it.
+  int opcode = cur_tok;
+  get_next_token();
+  if (auto operand = parse_unary()) {
+    return llvm::make_unique<UnaryExprAST>(opcode, std::move(operand));
+  }
+  return nullptr;
+}
+
 /// binorphs
 ///   ::= ('+' primary)*
 static std::unique_ptr<ExprAST> parse_binop_rhs(int expr_prec,
@@ -443,7 +489,7 @@ static std::unique_ptr<ExprAST> parse_binop_rhs(int expr_prec,
     int binop = cur_tok;
     get_next_token();
 
-    auto rhs = parse_primary();
+    auto rhs = parse_unary();
     if (!rhs) {
       return nullptr;
     }
@@ -467,7 +513,7 @@ static std::unique_ptr<ExprAST> parse_binop_rhs(int expr_prec,
 /// expression
 ///   ::= primary binoprhs
 static std::unique_ptr<ExprAST> parse_expression() {
-  auto lhs = parse_primary();
+  auto lhs = parse_unary();
   if (!lhs) {
     return nullptr;
   }
@@ -477,12 +523,49 @@ static std::unique_ptr<ExprAST> parse_expression() {
 /// prototype
 ///   ::= id '(' id* ')'
 static std::unique_ptr<PrototypeAST> parse_prototype() {
-  if (cur_tok != tok_identifier) {
-    return log_error_p("expected function name in prototype");
-  }
+  std::string fn_name;
 
-  std::string fn_name = identifier_str;
-  get_next_token();
+  unsigned kind = 0; // 0 = identifier, 1 = unary, 2 = binary
+  unsigned binary_prec = 30;
+
+  switch (cur_tok) {
+    default:
+      return log_error_p("Expected function name in prototype");
+    case tok_identifier:
+      fn_name = identifier_str;
+      kind = 0;
+      get_next_token();
+      break;
+    case tok_unary:
+      get_next_token();
+      if (!isascii(cur_tok)) {
+        return log_error_p("expected unary operator");
+      }
+      fn_name = "unary";
+      fn_name += (char) cur_tok;
+      kind = 1;
+      get_next_token();
+      break;
+    case tok_binary:
+      get_next_token();
+      if (!isascii(cur_tok)) {
+        return log_error_p("expected binary operator");
+      }
+      fn_name = "binary";
+      fn_name += (char) cur_tok;
+      kind = 2;
+      get_next_token();
+
+      // Read the precedence if present.
+      if (cur_tok == tok_number) {
+        if (num_val < 1 || num_val > 100) {
+          return log_error_p("invalid precedence: must be 1..100");
+        }
+        binary_prec = (unsigned)num_val;
+        get_next_token();
+      }
+      break;
+  }
 
   if (cur_tok != '(') {
     return log_error_p("expected '(' in prototype");
@@ -500,12 +583,17 @@ static std::unique_ptr<PrototypeAST> parse_prototype() {
   // Success.
   get_next_token();
 
-  return llvm::make_unique<PrototypeAST>(fn_name, std::move(arg_names));
+  if (kind && arg_names.size() != kind) {
+    return log_error_p("invalid number of operands for operator");
+  }
+
+  return llvm::make_unique<PrototypeAST>(fn_name, std::move(arg_names),
+      kind != 0, binary_prec);
 }
 
 // definition ::= 'def' prototype expression
 static std::unique_ptr<FunctionAST> parse_definition() {
-  get_next_token();
+  get_next_token(); // eat def.
   auto proto = parse_prototype();
   if (!proto) {
     return nullptr;
@@ -574,6 +662,20 @@ Value *VariableExprAST::codegen() {
   return v;
 }
 
+Value *UnaryExprAST::codegen() {
+  Value *operandv = operand->codegen();
+  if (!operandv) {
+    return nullptr;
+  }
+
+  Function *fn = get_function(std::string("unary") + opcode);
+  if (!fn) {
+    return log_error_v("unknown unary operator");
+  }
+
+  return builder.CreateCall(fn, operandv, "unop");
+}
+
 Value *BinaryExprAST::codegen() {
   Value *l = lhs->codegen();
   Value *r = rhs->codegen();
@@ -593,8 +695,16 @@ Value *BinaryExprAST::codegen() {
     // Convert bool 0/1 to double 0.0 or 1.0
     return builder.CreateUIToFP(l, Type::getDoubleTy(context), "booltmp");
   default:
-    return log_error_v("invalid binary operator");
+    break;
   }
+
+  // If it wasn't a builtin binary operator, it must be a user-defined one.
+  // Emit a call to it.
+  Function *fn = get_function(std::string("binary") + op);
+  assert(fn && "binary operator not found!");
+
+  Value *ops[2] = {l, r};
+  return builder.CreateCall(fn, ops, "binop");
 }
 
 Value *CallExprAST::codegen() {
@@ -643,12 +753,16 @@ Function *FunctionAST::codegen() {
   auto &p = *proto;
   fn_protos[proto->get_name()] = std::move(proto);
   Function *fn = get_function(p.get_name());
-  
   if (!fn) {
     return nullptr;
   }
   if (!fn->empty()) {
     return (Function*) log_error_v("Function cannot be redefined.");
+  }
+
+  // If this is an operator, install it.
+  if (p.is_binary_op()) {
+    binop_precedence[p.get_operator_name()] = p.get_binary_precedence();
   }
 
   // Create a new basic block to start insertion into.
@@ -889,9 +1003,12 @@ static void handle_top_level_expression() {
 }
 
 /// top ::= definition | external | expression | ';'
-static void main_loop() {
+static void main_loop(bool print) {
   for (;;) {
-    std::fprintf(stderr, "ready> ");
+    if (print) {
+      std::fprintf(stderr, "ready> ");
+    }
+    get_next_token();
     switch (cur_tok) {
     case tok_eof:
       return;
@@ -900,6 +1017,7 @@ static void main_loop() {
       break;
     case tok_def:
       handle_definition();
+      break;
     case tok_extern:
       handle_extern();
       break;
@@ -926,7 +1044,7 @@ extern "C" DLLEXPORT double printd(double x) {
   return 0;
 }
 
-int main() {
+int main(int argc, char **argv) {
   InitializeNativeTarget();
   InitializeNativeTargetAsmPrinter();
   InitializeNativeTargetAsmParser();
@@ -938,14 +1056,15 @@ int main() {
   binop_precedence['-'] = 20;
   binop_precedence['*'] = 40;
 
-  std::fprintf(stderr, "ready> ");
-  get_next_token();
-
   jit = llvm::make_unique<KaleidoscopeJIT>();
 
   init_module_and_pass_manager();
 
-  main_loop();
+  if (argc > 1 && std::string(argv[1]) == "-file") {
+    main_loop(false);
+  } else {
+    main_loop(true);
+  }
 
   return 0;
 }
