@@ -288,7 +288,13 @@ std::unique_ptr<PrototypeAST> log_error_p(const char *str) {
 
 /// binop_precedence - This holds the precedence for each binary operator
 /// that is defined.
-static std::map<char, int> binop_precedence;
+static std::map<char, int> binop_precedence = {
+  {'=', 2},
+  {'+', 20},
+  {'<', 10},
+  {'-', 20},
+  {'*', 40},
+};
 
 /// get_tok_precedence - Get the precedence of the pending binary operator
 /// token.
@@ -1201,14 +1207,6 @@ int main(int argc, char **argv) {
   InitializeNativeTarget();
   InitializeNativeTargetAsmPrinter();
   InitializeNativeTargetAsmParser();
-
-  // Install standard binary operators.
-  // 1 is lowest precedence.
-  binop_precedence['='] = 2;
-  binop_precedence['<'] = 10;
-  binop_precedence['+'] = 20;
-  binop_precedence['-'] = 20;
-  binop_precedence['*'] = 40;
 
   jit = llvm::make_unique<KaleidoscopeJIT>();
 
