@@ -61,6 +61,7 @@ enum Token {
 
 static std::string identifier_str; // Filled in if tok_identifier
 static double num_val;             // Filled in if tok_number
+static unsigned line_count = 1;
 
 // gettok - Return the next token from stdin
 static int gettok() {
@@ -68,6 +69,7 @@ static int gettok() {
 
   // Skip any whitespace.
   while (std::isspace(last_char)) {
+    if (last_char == '\n') line_count++;
     last_char = std::getchar();
   }
 
@@ -277,7 +279,7 @@ static int get_next_token() {
 }
 
 std::unique_ptr<ExprAST> log_error(const char *str) {
-  std::fprintf(stderr, "LogError: %s\n", str);
+  std::fprintf(stderr, "LogError on line %d: %s\n", line_count, str);
   return nullptr;
 }
 
