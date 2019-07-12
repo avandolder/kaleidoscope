@@ -1,35 +1,39 @@
 #include <algorithm>
+#include <cassert>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
 #include <memory>
 #include <string>
+#include <system_error>
+#include <utility>
 #include <vector>
 
 #include "llvm/ADT/APFloat.h"
+#include "llvm/ADT/Optional.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/IRBuilder.h"
-#include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Verifier.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Host.h"
+#include "llvm/Support/TargetRegistry.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
-#include "llvm/Transforms/InstCombine/InstCombine.h"
-#include "llvm/Transforms/Scalar.h"
-#include "llvm/Transforms/Scalar/GVN.h"
-
-#include "KaleidoscopeJIT.h"
+#include "llvm/Target/TargetOptions.h"
 
 using namespace llvm;
-using namespace llvm::orc;
+using namespace llvm::sys;
 
 //----- LEXER
 
@@ -700,8 +704,6 @@ static LLVMContext context;
 static IRBuilder<> builder(context);
 static std::unique_ptr<Module> module;
 static std::map<std::string, AllocaInst*> named_values;
-static std::unique_ptr<legacy::FunctionPassManager> fpm;
-static std::unique_ptr<KaleidoscopeJIT> jit;
 static std::map<std::string, std::unique_ptr<PrototypeAST>> fn_protos;
 
 Value *log_error_v(const char *str) {
@@ -710,8 +712,8 @@ Value *log_error_v(const char *str) {
 }
 
 Function *get_function(std::string name) {
-  if (auto *f = module->getFunction(name)) {
-    return f;
+  if (auto *fn = module->getFunction(name)) {
+    return fn;
   }
 
   auto fi = fn_protos.find(name);
@@ -726,10 +728,9 @@ Function *get_function(std::string name) {
 /// the function.  This is used for mutable variables etc.
 static AllocaInst *create_entry_block_alloca(Function *fn,
                                              const std::string &var_name) {
-  IRBuilder<> tmpb(&fn->getEntryBlock(),
-                    fn->getEntryBlock().begin());
-  return tmpb.CreateAlloca(Type::getDoubleTy(context), 0,
-                           var_name.c_str());
+  IRBuilder<> tmpb(&fn->getEntryBlock(), fn->getEntryBlock().begin());
+  return tmpb.CreateAlloca(
+    Type::getDoubleTy(context), nullptr, var_name.c_str());
 }
 
 Value *NumberExprAST::codegen() {
@@ -747,9 +748,7 @@ Value *VariableExprAST::codegen() {
 
 Value *UnaryExprAST::codegen() {
   Value *operandv = operand->codegen();
-  if (!operandv) {
-    return nullptr;
-  }
+  if (!operandv) return nullptr;
 
   Function *fn = get_function(std::string("unary") + opcode);
   if (!fn) {
@@ -763,15 +762,13 @@ Value *BinaryExprAST::codegen() {
   // Special case '=' because we don't want to emit the LHS as an expression.
   if (op == '=') {
     // Assignment requires the LHS to be an identifier.
-    VariableExprAST *lhse = dynamic_cast<VariableExprAST*>(lhs.get());
+    VariableExprAST *lhse = static_cast<VariableExprAST*>(lhs.get());
     if (!lhse) {
       return log_error_v("destination of '=' must be a variable");
     }
     // Codegen the RHS.
     Value *val = rhs->codegen();
-    if (!val) {
-      return nullptr;
-    }
+    if (!val) return nullptr;
 
     // Look up the name.
     Value *var = named_values[lhse->get_name()];
@@ -785,23 +782,21 @@ Value *BinaryExprAST::codegen() {
 
   Value *l = lhs->codegen();
   Value *r = rhs->codegen();
-  if (!l || !r) {
-    return nullptr;
-  }
+  if (!l || !r) return nullptr;
 
   switch (op) {
-  case '+':
-    return builder.CreateFAdd(l, r, "addtmp");
-  case '-':
-    return builder.CreateFSub(l, r, "subtmp");
-  case '*':
-    return builder.CreateFMul(l, r, "multmp");
-  case '<':
-    l = builder.CreateFCmpULT(l, r, "cmptmp");
-    // Convert bool 0/1 to double 0.0 or 1.0
-    return builder.CreateUIToFP(l, Type::getDoubleTy(context), "booltmp");
-  default:
-    break;
+    case '+':
+      return builder.CreateFAdd(l, r, "addtmp");
+    case '-':
+      return builder.CreateFSub(l, r, "subtmp");
+    case '*':
+      return builder.CreateFMul(l, r, "multmp");
+    case '<':
+      l = builder.CreateFCmpULT(l, r, "cmptmp");
+      // Convert bool 0/1 to double 0.0 or 1.0
+      return builder.CreateUIToFP(l, Type::getDoubleTy(context), "booltmp");
+    default:
+      break;
   }
 
   // If it wasn't a builtin binary operator, it must be a user-defined one.
@@ -836,79 +831,9 @@ Value *CallExprAST::codegen() {
   return builder.CreateCall(callee_fn, argsv, "calltmp");
 }
 
-Function *PrototypeAST::codegen() {
-  // Make the function type: double(double,double) etc.
-  std::vector<Type*> doubles(args.size(), Type::getDoubleTy(context));
-  FunctionType *ft =
-    FunctionType::get(Type::getDoubleTy(context), doubles, false);
-  Function *f =
-    Function::Create(ft, Function::ExternalLinkage, name, module.get());
-
-  // Set names for all arguments.
-  unsigned idx = 0;
-  for (auto &arg: f->args()) {
-    arg.setName(args[idx++]);
-  }
-
-  return f;
-}
-
-Function *FunctionAST::codegen() {
-  // Transfer ownership of the prototype to the fn_protos map, but keep a
-  // reference to it for use below.
-  auto &p = *proto;
-  fn_protos[proto->get_name()] = std::move(proto);
-  Function *fn = get_function(p.get_name());
-  if (!fn) {
-    return nullptr;
-  }
-  if (!fn->empty()) {
-    return (Function*) log_error_v("Function cannot be redefined.");
-  }
-
-  // If this is an operator, install it.
-  if (p.is_binary_op()) {
-    binop_precedence[p.get_operator_name()] = p.get_binary_precedence();
-  }
-
-  // Create a new basic block to start insertion into.
-  BasicBlock *bb = BasicBlock::Create(context, "entry", fn);
-  builder.SetInsertPoint(bb);
-
-  // Record the function arguments in the named_values map.
-  named_values.clear();
-  for (auto &arg: fn->args()) {
-    // Create an alloca for this alloca.
-    AllocaInst *alloca = create_entry_block_alloca(fn, arg.getName());
-    // Store the initial value into the alloca.
-    builder.CreateStore(&arg, alloca);
-    // Add arguments to the variable symbol table.
-    named_values[arg.getName()] = alloca;
-  }
-
-  if (Value *ret_val = body->codegen()) {
-    // Finish off the function.
-    builder.CreateRet(ret_val);
-
-    // Validate the generate code, checking for consistency.
-    verifyFunction(*fn);
-
-    // Optimize the function.
-    fpm->run(*fn);
-
-    return fn;
-  }
-
-  // Error reading body, remove function.
-  fn->eraseFromParent();
-  return nullptr;
-}
-
 Value *IfExprAST::codegen() {
   Value *condv = cond->codegen();
-  if (!condv) {
-    return nullptr;
-  }
+  if (!condv) return nullptr;
 
   // Convert condition to a bool by comparing to 0.0.
   condv = builder.CreateFCmpONE(
@@ -927,9 +852,7 @@ Value *IfExprAST::codegen() {
   builder.SetInsertPoint(thenbb);
 
   Value *thenv = thenexpr->codegen();
-  if (!thenv) {
-    return nullptr;
-  }
+  if (!thenv) return nullptr;
 
   builder.CreateBr(mergebb);
   // Codegen of the 'then' can change the current block, update thenbb for PHI.
@@ -940,9 +863,7 @@ Value *IfExprAST::codegen() {
   builder.SetInsertPoint(elsebb);
 
   Value *elsev = elseexpr->codegen();
-  if (!elsev) {
-    return nullptr;
-  }
+  if (!elsev) return nullptr;
 
   builder.CreateBr(mergebb);
   // codegen of 'Else' can change the current block, update elsebb for PHI.
@@ -967,15 +888,12 @@ Value *ForExprAST::codegen() {
 
   // Emit the start code first, without 'variable' in scope.
   Value *startv = start->codegen();
-  if (!startv) {
-    return nullptr;
-  }
+  if (!startv) return nullptr;
 
   // Store the value into the alloca.
   builder.CreateStore(startv, alloca);
 
   BasicBlock *loopbb = BasicBlock::Create(context, "loop", fn);
-
   // Insert an explicit fall through from the current block to the loopbb.
   builder.CreateBr(loopbb);
   // Start insertion in loopbb.
@@ -989,9 +907,7 @@ Value *ForExprAST::codegen() {
   // Emit the body of the loop. This, like any expr, can change the current
   // BB. Note that we ignore the value computed by the body, but don't allow
   // an error.
-  if (!body->codegen()) {
-    return nullptr;
-  }
+  if (!body->codegen()) return nullptr;
 
   // Emit the step value.
   Value *stepv = nullptr;
@@ -1080,31 +996,72 @@ Value *VarExprAST::codegen() {
   return bodyv;
 }
 
+Function *PrototypeAST::codegen() {
+  // Make the function type: double(double,double) etc.
+  std::vector<Type*> doubles(args.size(), Type::getDoubleTy(context));
+  FunctionType *ft =
+    FunctionType::get(Type::getDoubleTy(context), doubles, false);
+  Function *fn =
+    Function::Create(ft, Function::ExternalLinkage, name, module.get());
+
+  // Set names for all arguments.
+  unsigned idx = 0;
+  for (auto &arg: fn->args()) {
+    arg.setName(args[idx++]);
+  }
+
+  return fn;
+}
+
+Function *FunctionAST::codegen() {
+  // Transfer ownership of the prototype to the fn_protos map, but keep a
+  // reference to it for use below.
+  auto &p = *proto;
+  fn_protos[proto->get_name()] = std::move(proto);
+  Function *fn = get_function(p.get_name());
+  if (!fn) return nullptr;
+
+  // If this is an operator, install it.
+  if (p.is_binary_op()) {
+    binop_precedence[p.get_operator_name()] = p.get_binary_precedence();
+  }
+
+  // Create a new basic block to start insertion into.
+  BasicBlock *bb = BasicBlock::Create(context, "entry", fn);
+  builder.SetInsertPoint(bb);
+
+  // Record the function arguments in the named_values map.
+  named_values.clear();
+  for (auto &arg: fn->args()) {
+    // Create an alloca for this alloca.
+    AllocaInst *alloca = create_entry_block_alloca(fn, arg.getName());
+    // Store the initial value into the alloca.
+    builder.CreateStore(&arg, alloca);
+    // Add arguments to the variable symbol table.
+    named_values[arg.getName()] = alloca;
+  }
+
+  if (Value *ret_val = body->codegen()) {
+    // Finish off the function.
+    builder.CreateRet(ret_val);
+    // Validate the generate code, checking for consistency.
+    verifyFunction(*fn);
+    return fn;
+  }
+
+  // Error reading body, remove function.
+  fn->eraseFromParent();
+  if (p.is_binary_op()) {
+    binop_precedence.erase(p.get_operator_name());
+  }
+  return nullptr;
+}
+
+
 //----- OPTIMIZATION
 void init_module_and_pass_manager() {
   // Open a new module.
   module = llvm::make_unique<Module>("my cool jit", context);
-  module->setDataLayout(jit->getTargetMachine().createDataLayout());
-
-  // Create a new pass manager attached to it.
-  fpm = llvm::make_unique<legacy::FunctionPassManager>(module.get());
-
-  // Promote allocas to registers.
-  fpm->add(createPromoteMemoryToRegisterPass());
-  // Do simple "peephole" optimizations and bit-twiddling optzns.
-  fpm->add(createInstructionCombiningPass());
-  // Reassociate expressions.
-  fpm->add(createReassociatePass());
-  // Do simple "peephole" optimizations and bit-twiddling optzns.
-  fpm->add(createInstructionCombiningPass());
-  // Reassociate expressions.
-  fpm->add(createReassociatePass());
-  // Eliminate common subexpressions.
-  fpm->add(createGVNPass());
-  // Simplify the control flow graph (deleting unreachable blocks, etc).
-  fpm->add(createCFGSimplificationPass());
-
-  fpm->doInitialization();
 }
 
 //----- JIT DRIVER
@@ -1115,8 +1072,6 @@ static void handle_definition() {
       std::fprintf(stderr, "Read function definition:");
       fn_ir->print(errs());
       fprintf(stderr, "\n");
-      jit->addModule(std::move(module));
-      init_module_and_pass_manager();
     }
   } else {
     get_next_token();
@@ -1139,52 +1094,30 @@ static void handle_extern() {
 static void handle_top_level_expression() {
   // Evaluate a top-level expression into an anonymous function.
   if (auto fn_ast = parse_top_level_expr()) {
-    if (fn_ast->codegen()) {
-      // JIT the module containing the anon expr, keeping a handle so
-      // we can free it later.
-      auto h = jit->addModule(std::move(module));
-      init_module_and_pass_manager();
-
-      // Search the JIT for the __anon_expr symbol.
-      auto expr_symbol = jit->findSymbol("__anon_expr");
-      assert(expr_symbol && "Function not found");
-
-      // Get the symbol's addr and cast it to the right type (takes no
-      // arguments, returns a double) so we can call it as a native fn.
-      double (*fp)() = (double (*)())(intptr_t)cantFail(
-          expr_symbol.getAddress());
-      std::fprintf(stderr, "Evaluated to %f\n", fp());
-
-      // Delete anon expr module from the JIT.
-      jit->removeModule(h);
-    }
+    fn_ast->codegen();
   } else {
     get_next_token();
   }
 }
 
 /// top ::= definition | external | expression | ';'
-static void main_loop(bool print) {
+static void main_loop() {
   for (;;) {
-    if (print) {
-      std::fprintf(stderr, "ready> ");
-    }
-    get_next_token();
     switch (cur_tok) {
-    case tok_eof:
-      return;
-    case ';':
-      get_next_token();
-      break;
-    case tok_def:
-      handle_definition();
-      break;
-    case tok_extern:
-      handle_extern();
-      break;
-    default:
-      handle_top_level_expression();
-      break;
+      case tok_eof:
+        return;
+      case ';':
+        get_next_token();
+        break;
+      case tok_def:
+        handle_definition();
+        break;
+      case tok_extern:
+        handle_extern();
+        break;
+      default:
+        handle_top_level_expression();
+        break;
     }
   }
 }
@@ -1206,19 +1139,62 @@ extern "C" DLLEXPORT double printd(double x) {
 }
 
 int main(int argc, char **argv) {
-  InitializeNativeTarget();
-  InitializeNativeTargetAsmPrinter();
-  InitializeNativeTargetAsmParser();
+  // InitializeNativeTarget();
+  // InitializeNativeTargetAsmPrinter();
+  // InitializeNativeTargetAsmParser();
 
-  jit = llvm::make_unique<KaleidoscopeJIT>();
+  // jit = llvm::make_unique<KaleidoscopeJIT>();
 
   init_module_and_pass_manager();
 
-  if (argc > 1 && std::string(argv[1]) == "-file") {
-    main_loop(false);
-  } else {
-    main_loop(true);
+  get_next_token();
+  main_loop();
+
+  InitializeAllTargetInfos();
+  InitializeAllTargets();
+  InitializeAllTargetMCs();
+  InitializeAllAsmParsers();
+  InitializeAllAsmPrinters();
+
+  auto target_triple = sys::getDefaultTargetTriple();
+  module->setTargetTriple(target_triple);
+
+  std::string error;
+  auto target = TargetRegistry::lookupTarget(target_triple, error);
+
+  // Print an error and exit if we couldn't find the requested target.
+  if (!target) {
+    errs() << error;
+    return 1;
   }
+
+  auto cpu = "generic";
+  auto features = "";
+  TargetOptions opt;
+  auto rm = Optional<Reloc::Model>();
+  auto target_machine =
+    target->createTargetMachine(target_triple, cpu, features, opt, rm);
+  module->setDataLayout(target_machine->createDataLayout());
+
+  auto filename = "output.o";
+  std::error_code ec;
+  raw_fd_ostream dest(filename, ec, sys::fs::F_None);
+  if (ec) {
+    errs() << "Could not open file: " << ec.message();
+    return 1;
+  }
+
+  legacy::PassManager pass;
+  auto filetype = TargetMachine::CGFT_ObjectFile;
+  if (target_machine->addPassesToEmitFile(pass, dest, filetype)) {
+    errs() << "target_machine can't emit a file of this type";
+    return 1;
+  }
+
+  pass.run(*module);
+  dest.flush();
+
+  outs() << "Wrote " << filename << "\n";
 
   return 0;
 }
