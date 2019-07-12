@@ -991,7 +991,8 @@ static void handle_top_level_expression() {
 
       // Get the symbol's addr and cast it to the right type (takes no
       // arguments, returns a double) so we can call it as a native fn.
-      double (*fp)() = (double (*)())(intptr_t)cantFail(expr_symbol.getAddress());
+      double (*fp)() = (double (*)())(intptr_t)cantFail(
+          expr_symbol.getAddress());
       std::fprintf(stderr, "Evaluated to %f\n", fp());
 
       // Delete anon expr module from the JIT.
