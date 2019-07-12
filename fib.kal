@@ -10,6 +10,19 @@ def fib(x)
 
 printd(fib(10));
 
+def eq(x y)
+  if x < y then 0
+  else if y < x then 0
+  else 1;
+
+def fibt(n x y)
+  if (eq(n, 1)) then
+    x
+  else
+    fibt(n-1, y, x+y);
+
+printd(fibt(10, 1, 1));
+
 def fibi(x)
   var a = 1, b = 1, c in
   (for i = 3, i < x in
